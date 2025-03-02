@@ -4549,6 +4549,8 @@ __metadata:
     react-dom: "npm:^18.3.1"
     typescript: "npm:^5.7.3"
     vite: "npm:^6.1.0"
+    zod: "npm:^3.24.2"
+    zod-to-json-schema: "npm:^3.24.3"
   languageName: unknown
   linkType: soft
 
