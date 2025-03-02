@@ -225,7 +225,6 @@ type Tool<
   description?: string;
   parameters?: Params;
   rawParameters?: unknown;
-  hidden?: boolean;
   execute: (
     args: z.infer<Params>,
     context: Context<T>
@@ -372,6 +371,12 @@ type SamplingResponse = {
 
 type FastMCPSessionAuth = Record<string, unknown> | undefined;
 
+type GetTools<T> = ({
+  includeHidden,
+}?: {
+  includeHidden?: boolean;
+}) => Tool<T>[];
+
 export class FastMCPSession<
   T extends FastMCPSessionAuth = FastMCPSessionAuth,
 > extends FastMCPSessionEventEmitter {
@@ -389,7 +394,7 @@ export class FastMCPSession<
     auth,
     name,
     version,
-    tools,
+    getTools,
     resources,
     resourcesTemplates,
     prompts,
@@ -397,7 +402,7 @@ export class FastMCPSession<
     auth?: T;
     name: string;
     version: string;
-    tools: Tool<T>[];
+    getTools: GetTools<T>;
     resources: Resource[];
     resourcesTemplates: InputResourceTemplate[];
     prompts: Prompt[];
@@ -406,10 +411,7 @@ export class FastMCPSession<
 
     this.#auth = auth;
 
-    if (tools.length) {
-      this.#capabilities.tools = {};
-    }
-
+    this.#capabilities.tools = {};
     if (resources.length || resourcesTemplates.length) {
       this.#capabilities.resources = {};
     }
@@ -433,10 +435,7 @@ export class FastMCPSession<
     this.setupLoggingHandlers();
     this.setupRootsHandlers();
     this.setupCompleteHandlers();
-
-    if (tools.length) {
-      this.setupToolHandlers(tools);
-    }
+    this.setupToolHandlers(getTools);
 
     if (resources.length || resourcesTemplates.length) {
       for (const resource of resources) {
@@ -711,25 +710,25 @@ export class FastMCPSession<
     });
   }
 
-  private setupToolHandlers(tools: Tool<T>[]) {
+  private setupToolHandlers(getTools: GetTools<T>) {
     this.#server.setRequestHandler(ListToolsRequestSchema, async () => {
       return {
-        tools: tools
-          .filter((t) => !t.hidden)
-          .map((tool) => {
-            return {
-              name: tool.name,
-              description: tool.description,
-              inputSchema: tool.parameters
-                ? zodToJsonSchema(tool.parameters)
-                : tool.rawParameters,
-            };
-          }),
+        tools: getTools().map((tool) => {
+          return {
+            name: tool.name,
+            description: tool.description,
+            inputSchema: tool.parameters
+              ? zodToJsonSchema(tool.parameters)
+              : tool.rawParameters,
+          };
+        }),
       };
     });
 
     this.#server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      const tool = tools.find((tool) => tool.name === request.params.name);
+      const tool = getTools({ includeHidden: true }).find(
+        (tool) => tool.name === request.params.name
+      );
 
       if (!tool) {
         throw new McpError(
@@ -1043,10 +1042,12 @@ export class FastMCP<
   #resourcesTemplates: InputResourceTemplate[] = [];
   #sessions: FastMCPSession<T>[] = [];
   #sseServer: SSEServer | null = null;
-  #tools: Tool<T>[] = [];
   #authenticate: Authenticate<T> | undefined;
 
-  constructor(public options: ServerOptions<T>) {
+  constructor(
+    public options: ServerOptions<T>,
+    private getTools: () => Tool<T>[]
+  ) {
     super();
 
     this.#options = options;
@@ -1055,13 +1056,6 @@ export class FastMCP<
 
   public get sessions(): FastMCPSession<T>[] {
     return this.#sessions;
-  }
-
-  /**
-   * Adds a tool to the server.
-   */
-  public addTool<Params extends ToolParameters>(tool: Tool<T, Params>) {
-    this.#tools.push(tool as unknown as Tool<T>);
   }
 
   /**
@@ -1108,7 +1102,7 @@ export class FastMCP<
       const session = new FastMCPSession<T>({
         name: this.#options.name,
         version: this.#options.version,
-        tools: this.#tools,
+        getTools: () => this.getTools(),
         resources: this.#resources,
         resourcesTemplates: this.#resourcesTemplates,
         prompts: this.#prompts,
@@ -1136,7 +1130,7 @@ export class FastMCP<
             auth,
             name: this.#options.name,
             version: this.#options.version,
-            tools: this.#tools,
+            getTools: () => this.getTools(),
             resources: this.#resources,
             resourcesTemplates: this.#resourcesTemplates,
             prompts: this.#prompts,

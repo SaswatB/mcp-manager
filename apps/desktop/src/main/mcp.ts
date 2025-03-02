@@ -1,8 +1,5 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import {
-  StdioClientTransport,
-  StdioServerParameters,
-} from "@modelcontextprotocol/sdk/client/stdio.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import {
   ContentResult,
@@ -15,26 +12,76 @@ import { v4 as uuidv4 } from "uuid";
 import { z } from "zod";
 import { generateObject } from "ai";
 import { createAnthropic } from "@ai-sdk/anthropic";
-
 import { version } from "../../package.json";
-import zodToJsonSchema from "zod-to-json-schema";
+import fs from "fs";
+import path from "path";
+import os from "os";
+import * as chokidar from "chokidar";
+import { deepEqual } from "fast-equals";
 
 const OVERRIDE_PREFIX = "__mcp_manager__";
 const REQUEST_ACTIONS_OVERRIDE_TOOL = `${OVERRIDE_PREFIX}request_actions_filter_override`;
-const OVERRIDE_TOOLS = [REQUEST_ACTIONS_OVERRIDE_TOOL] as const;
+const CONFIG_PATH = path.join(os.homedir(), ".mcp_manager_config.json");
 
 type JsonSchemaParameters = {
   type: "object";
   properties?: Record<string, unknown>;
 };
+const ServerParametersSchema = z.union([
+  // stdio
+  z.object({
+    keywords: z.array(z.string()),
+    command: z.string(),
+    args: z.array(z.string()).optional(),
+    env: z.record(z.string(), z.string()).optional(),
+    cwd: z.string().optional(),
+  }),
+  // sse
+  z.object({
+    keywords: z.array(z.string()),
+    url: z.string().url(),
+  }),
+]);
 
-type ServerParameters =
-  | {
-      type: "stdio";
-      name: string;
-      config: Omit<StdioServerParameters, "stderr">;
-    }
-  | { type: "sse"; name: string; url: URL };
+type ServerParameters = z.infer<typeof ServerParametersSchema> & {
+  name: string;
+};
+
+const ConfigSchema = z.object({
+  mcpServers: z.record(z.string(), ServerParametersSchema),
+});
+
+type Config = z.infer<typeof ConfigSchema>;
+
+/**
+ * Load server configurations from a JSON file in the user's home directory
+ * Creates a default configuration if the file doesn't exist
+ */
+async function loadServerConfigs(): Promise<
+  (ServerParameters & { keywords: string[] })[]
+> {
+  // Create default config if it doesn't exist
+  if (!fs.existsSync(CONFIG_PATH)) {
+    const defaultConfig: Config = { mcpServers: {} };
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(defaultConfig, null, 2));
+    console.log(`Created default server config at ${CONFIG_PATH}`);
+    return [];
+  }
+
+  // Read existing config
+  try {
+    const configData = fs.readFileSync(CONFIG_PATH, "utf-8");
+    const configs = ConfigSchema.parse(JSON.parse(configData));
+    console.log(`Loaded server configurations from ${CONFIG_PATH}`);
+    return Object.entries(configs.mcpServers).map(([name, params]) => ({
+      ...params,
+      name,
+    }));
+  } catch (error) {
+    console.error(`Error loading server configurations: ${error}`);
+    throw error;
+  }
+}
 
 /**
  * Connect to an MCP server using either stdio or SSE transport
@@ -48,16 +95,16 @@ export async function connectToServer(params: ServerParameters) {
 
   // Handle different transport types
   const transport =
-    params.type === "stdio"
+    "command" in params
       ? new StdioClientTransport({
-          ...params.config,
+          ...params,
           env: {
             PATH: process.env.PATH || "",
-            ...params.config.env,
+            ...params.env,
           },
           stderr: "pipe",
         })
-      : new SSEClientTransport(params.url);
+      : new SSEClientTransport(new URL(params.url));
 
   // Set up error handler
   const errorSubject = new BehaviorSubject<string | undefined>(undefined);
@@ -114,7 +161,15 @@ export async function connectToServer(params: ServerParameters) {
     },
     client,
     transport,
-    close: () => transport.close(),
+    close: async () => {
+      statusSubject.next("closing");
+      console.log(`Closing connection to ${params.name}`);
+      await transport.close();
+      statusSubject.next("closed");
+      statusSubject.complete();
+      errorSubject.complete();
+      toolsSubject.complete();
+    },
   };
 }
 type ServerConnection = Awaited<ReturnType<typeof connectToServer>>;
@@ -135,198 +190,179 @@ interface ActionDefinition<
 }
 
 export const startMCP = async () => {
-  const mcpServer = new FastMCP({
-    name: "MCP Manager",
-    version: version as `${number}.${number}.${number}`,
-    authenticate: async () => ({ sessionId: uuidv4() }),
-  });
-  // Central registry of all available actions
-  const actionsRegistry: Record<string, ActionDefinition> = {};
+  // Load server configs from the user's home directory
+  let serverConfigs = await loadServerConfigs();
 
-  // Helper functions to add actions to the registry
-  const registerAction = (action: ActionDefinition) => {
-    const id = uuidv4();
-    actionsRegistry[id] = action;
-
-    // Handler to unregister the action
-    return () => {
-      delete actionsRegistry[id];
-    };
-  };
-
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const registerActionWithZod = <T extends z.ZodObject<any>>(
-    parameters: T,
-    action: Omit<ActionDefinition<z.infer<T>>, "parameters">
-  ) => {
-    return registerAction({
-      ...action,
-      parameters: zodToJsonSchema(parameters, "S").definitions
-        ?.S as JsonSchemaParameters,
-    });
-  };
-
-  // Register available actions
-  registerActionWithZod(
-    z.object({
-      min: z.number(),
-      max: z.number(),
-    }),
-    {
-      name: "random",
-      description: "Generate a random number",
-      keywords: ["random", "number", "generate"],
-      execute: (parameters) => {
-        const { min, max } = parameters;
-        return String(Math.floor(Math.random() * (max - min + 1)) + min);
-      },
-    }
-  );
-
-  registerActionWithZod(
-    z.object({
-      a: z.coerce.number(),
-      b: z.coerce.number(),
-    }),
-    {
-      name: "add",
-      description: "Add two numbers",
-      keywords: ["math", "addition", "sum"],
-      execute: (parameters) => {
-        const { a, b } = parameters;
-        return String(a + b);
-      },
-    }
-  );
-
-  const serverConfigs: (ServerParameters & { keywords: string[] })[] = [
-    {
-      type: "stdio",
-      name: "weather",
-      keywords: ["weather", "location"],
-      config: {
-        command: "uvx",
-        args: [
-          "--from",
-          "git+https://github.com/adhikasp/mcp-weather.git",
-          "mcp-weather",
-        ],
-        env: {
-          ACCUWEATHER_API_KEY: import.meta.env.VITE_ACCUWEATHER_API_KEY || "",
-        },
-      },
-    },
-  ];
-
-  // Track servers that provide the overrides
-  const overrideToolServers: Partial<
-    Record<(typeof OVERRIDE_TOOLS)[number], ServerConnection>
+  // Track server connections by name for easier reference
+  const serverMap: Record<
+    string,
+    { config: ServerParameters; connection: ServerConnection }
   > = {};
 
-  // Connect to all servers
-  const servers = await Promise.all(
-    serverConfigs.map(async (config) => {
-      const server = await connectToServer(config);
-      server.tools.subscribe((tools) => {
-        console.log("tools from server", config.name, tools);
+  // Function to connect to all configured servers with smart diffing
+  const connectToServers = async (newConfigs: ServerParameters[]) => {
+    // Identify servers to add, update, or keep
+    const serversToAdd: ServerParameters[] = [];
+    const serversToUpdate: ServerParameters[] = [];
+    const serversToKeep: string[] = [];
+    const serversToRemove: string[] = [];
 
-        for (const tool of tools) {
-          // Skip registering the override tool as a regular action
-          if (tool.name.startsWith(OVERRIDE_PREFIX)) {
-            if (
-              OVERRIDE_TOOLS.includes(
-                tool.name as (typeof OVERRIDE_TOOLS)[number]
-              )
-            ) {
-              console.log(
-                `Server ${config.name} provides ${tool.name} override tool`
-              );
-              if (overrideToolServers[tool.name]) {
-                console.error(
-                  `Server ${config.name} already has an ${tool.name} tool, overwriting`
-                );
-              }
-              overrideToolServers[tool.name] = server;
-            } else {
-              console.error(
-                `Server ${config.name} has an unknown override tool: ${tool.name}`
-              );
-            }
-            continue;
-          }
+    // Categorize new/updated servers
+    for (const newConfig of newConfigs) {
+      const existing = serverMap[newConfig.name];
 
-          registerAction({
-            name: tool.name,
-            description: tool.description || "",
-            keywords: config.keywords,
-            parameters: tool.inputSchema,
-            execute: (parameters) =>
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              server.callTool(tool.name, parameters) as any,
-          });
+      if (!existing) {
+        // New server
+        serversToAdd.push(newConfig);
+      } else if (!deepEqual(existing.config, newConfig)) {
+        // Config changed, update needed
+        serversToUpdate.push(newConfig);
+      } else {
+        // Config unchanged, keep existing connection
+        serversToKeep.push(newConfig.name);
+      }
+    }
 
-          // Direct passthrough in case the mcp server doesn't go through dispatch-actions
-          mcpServer.addTool({
-            name: tool.name,
-            description: tool.description || "",
-            rawParameters: tool.inputSchema,
-            hidden: true,
-            execute: (parameters) =>
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              server.callTool(tool.name, parameters) as any,
-          });
-        }
-      });
+    // Find servers to remove (in current but not in new)
+    const currentServerNames = Object.keys(serverMap);
+    const newServerNames = newConfigs.map((config) => config.name);
+    for (const name of currentServerNames) {
+      if (!newServerNames.includes(name)) {
+        serversToRemove.push(name);
+      }
+    }
 
-      return server;
-    })
-  );
-
-  // Helper function to get action by name
-  const getAction = (name: string): ActionDefinition | undefined => {
-    return Object.values(actionsRegistry).find(
-      (action) => action.name === name
+    console.log(
+      `Server changes: ${serversToAdd.length} to add, ${serversToUpdate.length} to update, ${serversToKeep.length} to keep, ${serversToRemove.length} to remove`
     );
+
+    // Remove servers that are no longer in config
+    for (const name of serversToRemove) {
+      const server = serverMap[name];
+      if (server) {
+        console.log(`Closing connection to removed server: ${name}`);
+        await server.connection.close();
+        delete serverMap[name];
+      }
+    }
+
+    // Update servers with changed configs
+    for (const config of serversToUpdate) {
+      const server = serverMap[config.name];
+      if (server) {
+        console.log(`Updating server connection: ${config.name}`);
+        await server.connection.close();
+        // Create new connection
+        const newConnection = await connectToServer(config);
+        serverMap[config.name] = {
+          config,
+          connection: newConnection,
+        };
+      }
+    }
+
+    // Add new servers
+    for (const config of serversToAdd) {
+      console.log(`Adding new server connection: ${config.name}`);
+      const newConnection = await connectToServer(config);
+      serverMap[config.name] = {
+        config,
+        connection: newConnection,
+      };
+    }
+
+    // Return all current server connections
+    return Object.values(serverMap).map((s) => s.connection);
   };
 
-  // Get all unique keywords from the registry
-  const getAllKeywords = (): string[] => {
-    const keywordSet = new Set<string>();
-    Object.values(actionsRegistry).forEach((action) => {
-      action.keywords.forEach((keyword) => keywordSet.add(keyword));
-    });
-    return Array.from(keywordSet);
-  };
+  const getActions = () =>
+    Object.values(serverMap).flatMap(({ connection, config }) =>
+      connection.tools.getValue().map((tool) => ({
+        name: tool.name,
+        keywords: config.keywords,
+        description: tool.description || "",
+        parameters: tool.inputSchema,
+        execute: (parameters) =>
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          connection.callTool(tool.name, parameters) as any,
+      }))
+    );
+
+  // Connect to initial servers
+  await connectToServers(serverConfigs);
+
+  // Set up file watcher to monitor configuration changes
+  const watcher = chokidar.watch(CONFIG_PATH, {
+    persistent: true,
+    awaitWriteFinish: {
+      stabilityThreshold: 2000,
+      pollInterval: 100,
+    },
+  });
+  watcher.on("change", async () => {
+    try {
+      console.log(`Server configuration file changed: ${CONFIG_PATH}`);
+
+      // Load the updated configuration
+      const newServerConfigs = await loadServerConfigs();
+
+      // Only update if configs are different
+      if (JSON.stringify(serverConfigs) !== JSON.stringify(newServerConfigs)) {
+        // Update servers using smart diffing
+        await connectToServers(newServerConfigs);
+        // Update the current config reference
+        serverConfigs = newServerConfigs;
+        console.log("Successfully updated server connections");
+      } else {
+        console.log(
+          "Configuration file changed but content is identical - no action needed"
+        );
+      }
+    } catch (error) {
+      console.error("Error updating server connections:", error);
+    }
+  });
 
   // Generate dynamic description for request-actions
   const getKeywordsDescription = (): string => {
-    const keywords = getAllKeywords();
-    return `Request the actions that can be performed. Current available actions are related to these keywords: '${keywords.join("', '")}'`;
+    const keywordSet = new Set<string>();
+    Object.values(serverMap).forEach(({ config }) => {
+      config.keywords.forEach((keyword) => keywordSet.add(keyword));
+    });
+    const keywords = Array.from(keywordSet);
+    return `Request the actions that can be performed. Actions remain available throughout the conversation unless otherwise specified. Current available actions are related to these keywords: '${keywords.join("', '")}'`;
   };
 
-  mcpServer.addTool({
+  const getRequestActionsTool = () => ({
     name: "request-actions",
     description: getKeywordsDescription(),
     parameters: z.object({
       why: z.string({
         description:
-          "Please give context on what you need actions for, this will help provide the relevant actions. Actions returned MUST be called with dispatch-actions tool.",
+          "Please give context on what you need actions for, this will help provide the relevant actions. Remember these are actions, not tools, actions returned MUST be called with dispatch-actions tool.",
       }),
     }),
     execute: async (args, context) => {
       console.log("request-actions tool called", args, context);
 
       // Get all available actions
-      const allActions = Object.values(actionsRegistry);
+      const rawActions = getActions();
+      const allActions = rawActions.filter(
+        (a) => !a.name.startsWith(OVERRIDE_PREFIX)
+      );
 
-      const logAndFormatResult = (result: unknown) => {
+      const logAndFormatResult = (
+        result: ActionDefinition<Record<string, unknown>>[]
+      ) => {
         const resultString = JSON.stringify(result);
         console.log("request-actions result", resultString);
         return resultString;
       };
 
       // Check if any server provides an override tool
-      const override = overrideToolServers[REQUEST_ACTIONS_OVERRIDE_TOOL];
+      const override = rawActions.find(
+        (a) => a.name === REQUEST_ACTIONS_OVERRIDE_TOOL
+      );
       if (override) {
         try {
           // Get the first server name that provides an override
@@ -335,17 +371,14 @@ export const startMCP = async () => {
           );
 
           // Call the override tool with the user's context and all available actions
-          const result = await override.callTool(
-            REQUEST_ACTIONS_OVERRIDE_TOOL,
-            {
-              why: args.why,
-              availableActions: allActions.map((action) => ({
-                name: action.name,
-                description: action.description,
-                keywords: action.keywords,
-              })),
-            }
-          );
+          const result = await override.execute({
+            why: args.why,
+            availableActions: allActions.map((action) => ({
+              name: action.name,
+              description: action.description,
+              keywords: action.keywords,
+            })),
+          });
 
           // The override tool should return either:
           // 1. An array of action names to include
@@ -434,7 +467,7 @@ export const startMCP = async () => {
         } = await generateObject({
           model: createAnthropic({
             apiKey: anthropicApiKey,
-          })("claude-3-sonnet-20240229"),
+          })("claude-3-7-sonnet-20250219"),
           schema: responseSchema,
           prompt: `
           The user needs help with: "${userContext}"
@@ -466,7 +499,7 @@ export const startMCP = async () => {
     },
   });
 
-  mcpServer.addTool({
+  const dispatchActionsTool = {
     name: "dispatch-actions",
     description: "Dispatch the actions available in the system",
     parameters: z.object({
@@ -475,7 +508,9 @@ export const startMCP = async () => {
     }),
     execute: async (args, context) => {
       console.log("dispatch-actions tool called", args, context);
-      const action = getAction(args.name);
+      const action = getActions()
+        .filter((a) => !a.name.startsWith(OVERRIDE_PREFIX))
+        .find((a) => a.name === args.name);
       if (!action) return "Unknown action";
       try {
         const result = await action.execute(args.parameters);
@@ -485,7 +520,16 @@ export const startMCP = async () => {
         return `Error: ${String(error)}`;
       }
     },
-  });
+  };
+
+  const mcpServer = new FastMCP(
+    {
+      name: "MCP Manager",
+      version: version as `${number}.${number}.${number}`,
+      authenticate: async () => ({ sessionId: uuidv4() }),
+    },
+    () => [getRequestActionsTool(), dispatchActionsTool]
+  );
 
   await mcpServer.start({
     transportType: "sse",
@@ -493,8 +537,12 @@ export const startMCP = async () => {
   });
 
   return async () => {
-    for (const server of servers) {
-      await server.close();
+    // Stop watching the config file
+    await watcher.close();
+
+    // Close all server connections
+    for (const serverData of Object.values(serverMap)) {
+      await serverData.connection.close();
     }
     await mcpServer.stop();
   };
