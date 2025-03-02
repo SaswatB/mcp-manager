@@ -3,6 +3,7 @@ import path from "path";
 import os from "os";
 import { z } from "zod";
 import * as chokidar from "chokidar";
+import { BehaviorSubject } from "rxjs";
 
 export const CONFIG_PATH = path.join(os.homedir(), ".mcp_manager_config.json");
 
@@ -37,7 +38,7 @@ export type Config = z.infer<typeof ConfigSchema>;
  * Load server configurations from a JSON file in the user's home directory
  * Creates a default configuration if the file doesn't exist
  */
-export async function loadServerConfigs(): Promise<ServerParameters[]> {
+async function loadServerConfigs(): Promise<ServerParameters[]> {
   // Create default config if it doesn't exist
   if (!fs.existsSync(CONFIG_PATH)) {
     const defaultConfig: Config = { mcpServers: {} };
@@ -61,15 +62,17 @@ export async function loadServerConfigs(): Promise<ServerParameters[]> {
   }
 }
 
-/**
- * Setup a watcher for config file changes
- * @param onConfigChange Callback function to handle config changes
- * @returns Function to close the watcher
- */
-export function setupConfigWatcher(
-  onConfigChange: (configs: ServerParameters[]) => Promise<void>
-): () => Promise<void> {
-  let currentConfigs: ServerParameters[] = [];
+// Function to initialize config and watcher
+export async function initializeConfig(): Promise<{
+  configs$: BehaviorSubject<ServerParameters[]>;
+  cleanup: () => Promise<void>;
+}> {
+  // Create a BehaviorSubject to track server configurations
+  const configs$ = new BehaviorSubject<ServerParameters[]>([]);
+
+  // Load initial configurations
+  const initialConfigs = await loadServerConfigs();
+  configs$.next(initialConfigs);
 
   // Set up file watcher to monitor configuration changes
   const watcher = chokidar.watch(CONFIG_PATH, {
@@ -88,33 +91,28 @@ export function setupConfigWatcher(
       const newServerConfigs = await loadServerConfigs();
 
       // Only update if configs are different
-      if (JSON.stringify(currentConfigs) !== JSON.stringify(newServerConfigs)) {
-        // Update servers using callback
-        await onConfigChange(newServerConfigs);
-        // Update the current config reference
-        currentConfigs = newServerConfigs;
-        console.log("Successfully updated server connections");
+      if (
+        JSON.stringify(configs$.getValue()) !== JSON.stringify(newServerConfigs)
+      ) {
+        // Update the BehaviorSubject with new configs
+        configs$.next(newServerConfigs);
+        console.log("Successfully updated server configurations");
       } else {
         console.log(
           "Configuration file changed but content is identical - no action needed"
         );
       }
     } catch (error) {
-      console.error("Error updating server connections:", error);
+      console.error("Error updating server configurations:", error);
     }
   });
 
-  // Initialize current configs
-  loadServerConfigs()
-    .then((configs) => {
-      currentConfigs = configs;
-    })
-    .catch((error) => {
-      console.error("Error loading initial configurations:", error);
-    });
-
-  // Return function to close the watcher
-  return async () => {
-    await watcher.close();
+  // Return the BehaviorSubject and cleanup function
+  return {
+    configs$,
+    cleanup: async () => {
+      await watcher.close();
+      configs$.complete();
+    },
   };
 }

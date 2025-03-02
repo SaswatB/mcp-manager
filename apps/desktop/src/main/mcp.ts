@@ -1,8 +1,8 @@
 import { FastMCP } from "./FastMCPProxy";
 import { v4 as uuidv4 } from "uuid";
 import { version } from "../../package.json";
-import { loadServerConfigs, setupConfigWatcher } from "./config";
-import { ServerMap, connectToServers } from "./connections";
+import { initializeConfig } from "./config";
+import { ServerMap, updateServerMap } from "./connections";
 import { createDispatchActionsTool, createRequestActionsTool } from "./actions";
 
 /**
@@ -10,19 +10,23 @@ import { createDispatchActionsTool, createRequestActionsTool } from "./actions";
  * @returns Function to clean up and close all connections
  */
 export const startMCP = async () => {
-  // Load server configs from the user's home directory
-  let serverConfigs = await loadServerConfigs();
+  // Initialize config and get references to the configs stream and cleanup function
+  const { configs$, cleanup: stopConfigWatcher } = await initializeConfig();
 
   // Track server connections by name for easier reference
   const serverMap: ServerMap = {};
 
-  // Connect to initial servers
-  await connectToServers(serverMap, serverConfigs);
+  // Initial connection to servers
+  const initialConfigs = configs$.getValue();
+  await updateServerMap(serverMap, initialConfigs);
 
-  // Set up config watcher to handle configuration changes
-  const stopWatcher = setupConfigWatcher(async (newConfigs) => {
-    await connectToServers(serverMap, newConfigs);
-    serverConfigs = newConfigs;
+  // Subscribe to config changes and update server connections
+  const configSubscription = configs$.subscribe(async (newConfigs) => {
+    // Skip the initial value since we've already connected to those servers
+    if (newConfigs !== initialConfigs) {
+      console.log("Config changed, updating server connections");
+      await updateServerMap(serverMap, newConfigs);
+    }
   });
 
   // Initialize and start the MCP server
@@ -45,8 +49,11 @@ export const startMCP = async () => {
 
   // Return a cleanup function
   return async () => {
+    // Unsubscribe from config changes
+    configSubscription.unsubscribe();
+
     // Stop watching the config file
-    await stopWatcher();
+    await stopConfigWatcher();
 
     // Close all server connections
     for (const serverData of Object.values(serverMap)) {

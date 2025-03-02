@@ -111,7 +111,7 @@ export type ServerMap = Record<
 /**
  * Manages connections to configured servers with smart diffing
  */
-export async function connectToServers(
+export async function updateServerMap(
   serverMap: ServerMap,
   newConfigs: ServerParameters[]
 ): Promise<ServerConnection[]> {
