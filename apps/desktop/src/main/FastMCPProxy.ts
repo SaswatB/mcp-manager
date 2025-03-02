@@ -371,7 +371,7 @@ type SamplingResponse = {
 
 type FastMCPSessionAuth = Record<string, unknown> | undefined;
 
-type GetTools<T> = ({
+type GetTools<T extends FastMCPSessionAuth> = ({
   includeHidden,
 }?: {
   includeHidden?: boolean;

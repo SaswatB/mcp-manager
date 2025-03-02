@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Button, Theme, Separator } from "@radix-ui/themes";
 import "normalize.css";
 import "@radix-ui/themes/styles.css";
@@ -504,8 +504,92 @@ const ConnectionCodeBlock = styled.div`
   border: 1px solid #2d2640;
 `;
 
+// Add a modal component for adding servers manually
+const AddServerModal = styled.div<{ isOpen: boolean }>`
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background-color: rgba(0, 0, 0, 0.5);
+  display: ${(props) => (props.isOpen ? "flex" : "none")};
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+`;
+
+const ModalContent = styled.div`
+  background-color: #1a1625;
+  border-radius: 8px;
+  padding: 1.5rem;
+  width: 450px;
+  box-shadow: 0 5px 20px rgba(0, 0, 0, 0.3);
+  border: 1px solid #2d2640;
+`;
+
+const ModalTitle = styled.div`
+  font-size: 1.25rem;
+  font-weight: 600;
+  margin-bottom: 1rem;
+  color: #a78bfa;
+`;
+
+const FormGroup = styled.div`
+  margin-bottom: 1rem;
+`;
+
+const FormLabel = styled.label`
+  display: block;
+  margin-bottom: 0.5rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+`;
+
+const TextInput = styled.input`
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+  border: 1px solid #2d2640;
+  background-color: #211c2f;
+  color: #e2e8f0;
+  font-size: 0.875rem;
+
+  &:focus {
+    outline: none;
+    border-color: #a78bfa;
+    box-shadow: 0 0 0 2px rgba(167, 139, 250, 0.25);
+  }
+`;
+
+const ButtonGroup = styled.div`
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 1.5rem;
+`;
+
 // Simplify the Connections page content
 const ConnectionsContent = () => {
+  const [connectionUrl, setConnectionUrl] = useState("");
+  const [isLoading, setIsLoading] = useState(true);
+
+  useEffect(() => {
+    const loadConnectionUrl = async () => {
+      try {
+        setIsLoading(true);
+        const url = await window.api.getMCPConnectionURL();
+        setConnectionUrl(url);
+      } catch (error) {
+        console.error("Error loading MCP connection URL:", error);
+        setConnectionUrl("Error loading connection URL");
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    loadConnectionUrl();
+  }, []);
+
   return (
     <div className={styles.paddingNone}>
       <Card>
@@ -519,7 +603,9 @@ const ConnectionsContent = () => {
           MCP Manager is available at the following URL:
         </Label>
 
-        <ConnectionCodeBlock>http://localhost:3000/api/mcp</ConnectionCodeBlock>
+        <ConnectionCodeBlock>
+          {isLoading ? "Loading..." : connectionUrl}
+        </ConnectionCodeBlock>
 
         <SeparatorWithMargin />
 
@@ -562,31 +648,19 @@ const ConnectionsContent = () => {
 const ServersContent = () => {
   const [servers, setServers] = useState<
     {
-      id: number;
+      id?: number;
       name: string;
       ip: string;
-      status?: boolean;
+      status?: string;
+      error?: string;
       description?: string;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      config?: any;
     }[]
-  >([
-    {
-      id: 1,
-      name: "Production Server 1",
-      ip: "10.1.1.1",
-      status: true,
-      description: "Main production MCP server",
-    },
-    {
-      id: 2,
-      name: "Production Server 2",
-      ip: "10.1.1.2",
-      status: false,
-      description: "Backup production MCP server",
-    },
-  ]);
-  const [activeTab, setActiveTab] = useState<"saved" | "discover">(
-    servers.length > 0 ? "saved" : "discover"
-  );
+  >([]);
+  const [activeTab, setActiveTab] = useState<"saved" | "discover">("saved");
+  const [isLoading, setIsLoading] = useState(true);
+  const [searchTerm, setSearchTerm] = useState("");
 
   const [discoveredServers] = useState<
     { id: number; name: string; ip: string; description: string }[]
@@ -614,23 +688,192 @@ const ServersContent = () => {
     },
   ]);
 
-  const addServer = (server: {
+  // Add state for the modal
+  const [isAddModalOpen, setIsAddModalOpen] = useState(false);
+  const [newServer, setNewServer] = useState({
+    name: "",
+    url: "",
+  });
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Load servers on component mount
+  useEffect(() => {
+    const fetchServers = async () => {
+      try {
+        setIsLoading(true);
+        const serverData = await window.api.getServers();
+        console.log("serverData", serverData);
+        setServers(serverData);
+      } catch (error) {
+        console.error("Error fetching servers:", error);
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    fetchServers();
+
+    // Set up event listeners for server status changes
+    window.api.onServerStatusChange((_, serverInfo) => {
+      setServers((prevServers) => {
+        const updatedServers = [...prevServers];
+        const index = updatedServers.findIndex(
+          (s) => s.name === serverInfo.name
+        );
+
+        if (index !== -1) {
+          updatedServers[index] = {
+            ...updatedServers[index]!,
+            status: serverInfo.status,
+            error: serverInfo.error,
+          };
+        } else {
+          updatedServers.push(serverInfo);
+        }
+
+        return updatedServers;
+      });
+    });
+
+    window.api.onServerError((_, serverInfo) => {
+      setServers((prevServers) => {
+        const updatedServers = [...prevServers];
+        const index = updatedServers.findIndex(
+          (s) => s.name === serverInfo.name
+        );
+
+        if (index !== -1) {
+          updatedServers[index] = {
+            ...updatedServers[index]!,
+            status: serverInfo.status,
+            error: serverInfo.error,
+          };
+        }
+
+        return updatedServers;
+      });
+    });
+
+    // Clean up event listeners on unmount
+    return () => {
+      window.api.removeAllListeners();
+    };
+  }, []);
+
+  const addServer = async (server: {
     id: number;
     name: string;
     ip: string;
     description: string;
   }) => {
-    setServers([...servers, { ...server, status: false }]);
+    try {
+      // Create a server config from the discovered server
+      const serverConfig = {
+        name: server.name,
+        url: `http://${server.ip}:8371/mcp`,
+        keywords: ["mcp"],
+      };
+
+      const success = await window.api.addServer(serverConfig);
+
+      if (success) {
+        // The server will be added through the getServers call
+        // which happens after the config change is detected
+        setActiveTab("saved");
+      }
+    } catch (error) {
+      console.error("Error adding server:", error);
+    }
   };
+
+  const connectToServer = async (serverName: string) => {
+    try {
+      await window.api.connectServer(serverName);
+    } catch (error) {
+      console.error(`Error connecting to server ${serverName}:`, error);
+    }
+  };
+
+  const disconnectServer = async (serverName: string) => {
+    try {
+      await window.api.disconnectServer(serverName);
+    } catch (error) {
+      console.error(`Error disconnecting from server ${serverName}:`, error);
+    }
+  };
+
+  const removeServer = async (serverName: string) => {
+    try {
+      await window.api.removeServer(serverName);
+    } catch (error) {
+      console.error(`Error removing server ${serverName}:`, error);
+    }
+  };
+
+  const handleAddServerManually = async () => {
+    if (!newServer.name.trim() || !newServer.url.trim()) {
+      return;
+    }
+
+    try {
+      setIsSubmitting(true);
+
+      // Create server config object
+      const serverConfig = {
+        name: newServer.name.trim(),
+        url: newServer.url.trim(),
+        keywords: ["mcp"],
+      };
+
+      const success = await window.api.addServer(serverConfig);
+
+      if (success) {
+        // Close modal and reset form
+        setNewServer({ name: "", url: "" });
+        setIsAddModalOpen(false);
+      }
+    } catch (error) {
+      console.error("Error adding server:", error);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const { name, value } = e.target;
+    setNewServer((prev) => ({ ...prev, [name]: value }));
+  };
+
+  const filteredServers =
+    searchTerm.trim() === ""
+      ? servers
+      : servers.filter(
+          (server) =>
+            server.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
+            server.ip.toLowerCase().includes(searchTerm.toLowerCase()) ||
+            (server.description &&
+              server.description
+                .toLowerCase()
+                .includes(searchTerm.toLowerCase()))
+        );
 
   return (
     <div className={styles.paddingNone}>
       <FlexRow alignItems="center" className={styles.marginBottomMd}>
         <SearchContainer>
           <Search size={14} />
-          <SearchInput placeholder="Search by name, IP, or description..." />
+          <SearchInput
+            placeholder="Search by name, IP, or description..."
+            value={searchTerm}
+            onChange={(e) => setSearchTerm(e.target.value)}
+          />
         </SearchContainer>
-        <ButtonWithMargin>Search</ButtonWithMargin>
+        <ButtonWithMargin onClick={() => setSearchTerm("")}>
+          Clear
+        </ButtonWithMargin>
+        <ButtonWithMargin onClick={() => setIsAddModalOpen(true)}>
+          Add Server
+        </ButtonWithMargin>
       </FlexRow>
 
       <TabsContainer>
@@ -648,26 +891,61 @@ const ServersContent = () => {
         </Tab>
       </TabsContainer>
 
-      {activeTab === "saved" ? (
-        servers.length > 0 ? (
+      {isLoading ? (
+        <EmptyStateContainer>
+          <Label
+            fontSize="0.875rem"
+            fontWeight="500"
+            className={styles.marginBottomXs}
+          >
+            Loading servers...
+          </Label>
+        </EmptyStateContainer>
+      ) : activeTab === "saved" ? (
+        filteredServers.length > 0 ? (
           <CardNoPadding>
-            {servers.map((server) => (
-              <ServerItemDiv key={server.id}>
+            {filteredServers.map((server) => (
+              <ServerItemDiv key={server.name}>
                 <FlexRow alignItems="center">
-                  <StatusDot isActive={server.status} />
+                  <StatusDot isActive={server.status === "connected"} />
                   <ServerInfo>
                     <ServerName>{server.name}</ServerName>
                     <ServerMeta>
                       {server.ip} •{" "}
-                      {server.status ? "Connected" : "Disconnected"}
+                      {server.status === "connected"
+                        ? "Connected"
+                        : server.status === "connecting"
+                          ? "Connecting..."
+                          : server.status === "closing"
+                            ? "Disconnecting..."
+                            : "Disconnected"}
+                      {server.error && ` • Error: ${server.error}`}
                     </ServerMeta>
                   </ServerInfo>
                   <FlexRow className={styles.marginLeftAuto} gap="0.375rem">
-                    <Button size="1" variant="soft">
-                      Connect
-                    </Button>
-                    <Button size="1" variant="outline">
-                      Edit
+                    {server.status === "connected" ? (
+                      <Button
+                        size="1"
+                        variant="soft"
+                        onClick={() => disconnectServer(server.name)}
+                      >
+                        Disconnect
+                      </Button>
+                    ) : (
+                      <Button
+                        size="1"
+                        variant="soft"
+                        onClick={() => connectToServer(server.name)}
+                      >
+                        Connect
+                      </Button>
+                    )}
+                    <Button
+                      size="1"
+                      variant="outline"
+                      onClick={() => removeServer(server.name)}
+                    >
+                      Remove
                     </Button>
                   </FlexRow>
                 </FlexRow>
@@ -693,7 +971,17 @@ const ServersContent = () => {
             >
               Add a server manually or discover servers on your network
             </Label>
-            <Button>Add Your First Server</Button>
+            <FlexRow gap="0.5rem" justifyContent="center">
+              <Button onClick={() => setIsAddModalOpen(true)}>
+                Add Server
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => setActiveTab("discover")}
+              >
+                Discover Servers
+              </Button>
+            </FlexRow>
           </EmptyStateContainer>
         )
       ) : discoveredServers.length > 0 ? (
@@ -744,86 +1032,293 @@ const ServersContent = () => {
           <Button>Scan Network</Button>
         </EmptyStateContainer>
       )}
+
+      {/* Add Server Modal */}
+      <AddServerModal isOpen={isAddModalOpen}>
+        <ModalContent>
+          <ModalTitle>Add MCP Server</ModalTitle>
+
+          <FormGroup>
+            <FormLabel>Server Name</FormLabel>
+            <TextInput
+              type="text"
+              name="name"
+              value={newServer.name}
+              onChange={handleInputChange}
+              placeholder="e.g. My MCP Server"
+            />
+          </FormGroup>
+
+          <FormGroup>
+            <FormLabel>Server URL</FormLabel>
+            <TextInput
+              type="text"
+              name="url"
+              value={newServer.url}
+              onChange={handleInputChange}
+              placeholder="e.g. http://localhost:8371/mcp"
+            />
+          </FormGroup>
+
+          <ButtonGroup>
+            <Button
+              size="2"
+              variant="outline"
+              onClick={() => {
+                setIsAddModalOpen(false);
+                setNewServer({ name: "", url: "" });
+              }}
+              disabled={isSubmitting}
+            >
+              Cancel
+            </Button>
+            <Button
+              size="2"
+              onClick={handleAddServerManually}
+              disabled={
+                isSubmitting || !newServer.name.trim() || !newServer.url.trim()
+              }
+            >
+              {isSubmitting ? "Adding..." : "Add Server"}
+            </Button>
+          </ButtonGroup>
+        </ModalContent>
+      </AddServerModal>
     </div>
   );
 };
 
 // Update SettingsContent to be more compact
-const SettingsContent = () => (
-  <div className={styles.paddingNone}>
-    <Card>
-      <CardTitle>General Settings</CardTitle>
+const SettingsContent = () => {
+  const [settings, setSettings] = useState<{
+    connectionTimeout: number;
+    startOnBoot: boolean;
+    logLevel: string;
+    mcpPort: number;
+  }>({
+    connectionTimeout: 30,
+    startOnBoot: false,
+    logLevel: "info",
+    mcpPort: 8371,
+  });
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
 
-      <SeparatorWithMargin />
+  // Load settings on component mount
+  useEffect(() => {
+    const fetchSettings = async () => {
+      try {
+        setIsLoading(true);
+        // const settingsData = await window.api.getSettings();
+        // setSettings(settingsData);
+      } catch (error) {
+        console.error("Error fetching settings:", error);
+      } finally {
+        setIsLoading(false);
+      }
+    };
 
-      <div className={styles.marginBottomSm}>
-        <Label
-          fontSize="0.8125rem"
-          fontWeight="500"
-          className={styles.marginBottomXs}
-        >
-          Connection Timeout
-        </Label>
-        <SelectBox>
-          <option value="30">30 seconds</option>
-          <option value="60">60 seconds</option>
-          <option value="120">120 seconds</option>
-        </SelectBox>
+    fetchSettings();
+  }, []);
+
+  const handleConnectionTimeoutChange = (
+    e: React.ChangeEvent<HTMLSelectElement>
+  ) => {
+    const value = parseInt(e.target.value, 10);
+    setSettings((prev) => ({ ...prev, connectionTimeout: value }));
+    saveSettings({ connectionTimeout: value });
+  };
+
+  const handleStartOnBootChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const value = e.target.checked;
+    setSettings((prev) => ({ ...prev, startOnBoot: value }));
+    saveSettings({ startOnBoot: value });
+  };
+
+  const handleLogLevelChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const value = e.target.value;
+    setSettings((prev) => ({ ...prev, logLevel: value }));
+    saveSettings({ logLevel: value });
+  };
+
+  const saveSettings = async (updatedSettings: Partial<typeof settings>) => {
+    try {
+      setIsSaving(true);
+      await window.api.updateSettings(updatedSettings);
+    } catch (error) {
+      console.error("Error saving settings:", error);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  if (isLoading) {
+    return (
+      <div className={styles.paddingNone}>
+        <Card>
+          <CardTitle>Loading settings...</CardTitle>
+        </Card>
       </div>
+    );
+  }
 
-      <SeparatorWithMargin />
+  return (
+    <div className={styles.paddingNone}>
+      <Card>
+        <CardTitle>General Settings</CardTitle>
 
-      <div>
-        <Label
-          fontSize="0.8125rem"
-          fontWeight="500"
-          className={styles.marginBottomXs}
-        >
-          Start on Boot
-        </Label>
-        <CheckboxLabel>
-          <Checkbox type="checkbox" />
-          <Label fontSize="0.8125rem">
-            Launch MCP Manager when your computer starts
+        <SeparatorWithMargin />
+
+        <div className={styles.marginBottomSm}>
+          <Label
+            fontSize="0.8125rem"
+            fontWeight="500"
+            className={styles.marginBottomXs}
+          >
+            Connection Timeout
           </Label>
-        </CheckboxLabel>
-      </div>
-    </Card>
-  </div>
-);
+          <SelectBox
+            value={settings.connectionTimeout.toString()}
+            onChange={handleConnectionTimeoutChange}
+            disabled={isSaving}
+          >
+            <option value="15">15 seconds</option>
+            <option value="30">30 seconds</option>
+            <option value="60">60 seconds</option>
+            <option value="120">120 seconds</option>
+          </SelectBox>
+        </div>
+
+        <SeparatorWithMargin />
+
+        <div className={styles.marginBottomSm}>
+          <Label
+            fontSize="0.8125rem"
+            fontWeight="500"
+            className={styles.marginBottomXs}
+          >
+            Log Level
+          </Label>
+          <SelectBox
+            value={settings.logLevel}
+            onChange={handleLogLevelChange}
+            disabled={isSaving}
+          >
+            <option value="debug">Debug</option>
+            <option value="info">Info</option>
+            <option value="warn">Warning</option>
+            <option value="error">Error</option>
+          </SelectBox>
+        </div>
+
+        <SeparatorWithMargin />
+
+        <div>
+          <Label
+            fontSize="0.8125rem"
+            fontWeight="500"
+            className={styles.marginBottomXs}
+          >
+            Start on Boot
+          </Label>
+          <CheckboxLabel>
+            <Checkbox
+              type="checkbox"
+              checked={settings.startOnBoot}
+              onChange={handleStartOnBootChange}
+              disabled={isSaving}
+            />
+            <Label fontSize="0.8125rem">
+              Launch MCP Manager when your computer starts
+            </Label>
+          </CheckboxLabel>
+        </div>
+      </Card>
+    </div>
+  );
+};
 
 // Update LogsContent for more efficient space usage
-const LogsContent = () => (
-  <div className={styles.paddingNone}>
-    <FlexRow
-      justifyContent="space-between"
-      alignItems="center"
-      className={styles.marginBottomSm}
-    >
-      <CardTitleNoMargin>System Logs</CardTitleNoMargin>
-      <FlexRow gap="0.375rem">
-        <Button size="1" variant="outline">
-          Clear Logs
-        </Button>
-        <Button size="1">Export</Button>
-      </FlexRow>
-    </FlexRow>
+const LogsContent = () => {
+  const [logs, setLogs] = useState<
+    Array<{ timestamp: string; level: string; message: string }>
+  >([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const logsContainerRef = useRef<HTMLDivElement>(null);
 
-    <LogsContainer>
-      {[...Array(15)].map((_, i) => (
-        <LogEntry key={i}>
-          {`[${new Date().toISOString()}] ${
-            i % 3 === 0
-              ? "INFO: Application started successfully"
-              : i % 3 === 1
-                ? "DEBUG: Connecting to server at 10.0.0.1..."
-                : "WARN: Connection attempt timed out"
-          }`}
-        </LogEntry>
-      ))}
-    </LogsContainer>
-  </div>
-);
+  // Load logs on component mount
+  useEffect(() => {
+    const fetchLogs = async () => {
+      try {
+        setIsLoading(true);
+        const logData = await window.api.getLogs();
+        setLogs(logData);
+      } catch (error) {
+        console.error("Error fetching logs:", error);
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    fetchLogs();
+
+    // Subscribe to new log entries
+    window.api.onLogEntry((_, logEntry) => {
+      setLogs((prevLogs) => [logEntry, ...prevLogs].slice(0, 1000));
+
+      // Scroll to top when new logs arrive
+      if (logsContainerRef.current) {
+        logsContainerRef.current.scrollTop = 0;
+      }
+    });
+
+    // Clean up event listener on unmount
+    return () => {
+      window.api.removeAllListeners();
+    };
+  }, []);
+
+  const handleClearLogs = async () => {
+    try {
+      await window.api.clearLogs();
+      setLogs([]);
+    } catch (error) {
+      console.error("Error clearing logs:", error);
+    }
+  };
+
+  return (
+    <div className={styles.paddingNone}>
+      <FlexRow
+        justifyContent="space-between"
+        alignItems="center"
+        className={styles.marginBottomSm}
+      >
+        <CardTitleNoMargin>System Logs</CardTitleNoMargin>
+        <FlexRow gap="0.375rem">
+          <Button size="1" variant="outline" onClick={handleClearLogs}>
+            Clear Logs
+          </Button>
+          <Button size="1">Export</Button>
+        </FlexRow>
+      </FlexRow>
+
+      <LogsContainer ref={logsContainerRef}>
+        {isLoading ? (
+          <LogEntry>Loading logs...</LogEntry>
+        ) : logs.length > 0 ? (
+          logs.map((log, index) => (
+            <LogEntry key={index}>
+              {`[${new Date(log.timestamp).toLocaleString()}] [${log.level}] ${log.message}`}
+            </LogEntry>
+          ))
+        ) : (
+          <LogEntry>No logs available</LogEntry>
+        )}
+      </LogsContainer>
+    </div>
+  );
+};
 
 // Update Page Header Component to be more compact
 const PageHeader = ({

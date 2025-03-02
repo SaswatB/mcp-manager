@@ -4,7 +4,7 @@ import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { BehaviorSubject } from "rxjs";
 import { deepEqual } from "fast-equals";
 import { version } from "../../package.json";
-import { ServerParameters } from "./config";
+import { Config, ServerParameters } from "./config";
 
 type JsonSchemaParameters = {
   type: "object";
@@ -111,80 +111,102 @@ export type ServerMap = Record<
 /**
  * Manages connections to configured servers with smart diffing
  */
-export async function updateServerMap(
-  serverMap: ServerMap,
-  newConfigs: ServerParameters[]
-): Promise<ServerConnection[]> {
-  // Identify servers to add, update, or keep
-  const serversToAdd: ServerParameters[] = [];
-  const serversToUpdate: ServerParameters[] = [];
-  const serversToKeep: string[] = [];
-  const serversToRemove: string[] = [];
+export async function createServerMap(newConfigs: BehaviorSubject<Config>) {
+  const serverMap$ = new BehaviorSubject<ServerMap>({});
 
-  // Categorize new/updated servers
-  for (const newConfig of newConfigs) {
-    const existing = serverMap[newConfig.name];
+  const subscription = newConfigs.subscribe(async (newConfigs) => {
+    const newServerConfigs = Object.entries(newConfigs.mcpServers || {}).map(
+      ([name, params]) => ({
+        ...params,
+        name,
+      })
+    );
 
-    if (!existing) {
-      // New server
-      serversToAdd.push(newConfig);
-    } else if (!deepEqual(existing.config, newConfig)) {
-      // Config changed, update needed
-      serversToUpdate.push(newConfig);
-    } else {
-      // Config unchanged, keep existing connection
-      serversToKeep.push(newConfig.name);
+    // Identify servers to add, update, or keep
+    const serversToAdd: ServerParameters[] = [];
+    const serversToUpdate: ServerParameters[] = [];
+    const serversToKeep: string[] = [];
+    const serversToRemove: string[] = [];
+    const serverMap = { ...serverMap$.getValue() };
+
+    // Categorize new/updated servers
+    for (const newConfig of newServerConfigs) {
+      const existing = serverMap[newConfig.name];
+
+      if (!existing) {
+        // New server
+        serversToAdd.push(newConfig);
+      } else if (!deepEqual(existing.config, newConfig)) {
+        // Config changed, update needed
+        serversToUpdate.push(newConfig);
+      } else {
+        // Config unchanged, keep existing connection
+        serversToKeep.push(newConfig.name);
+      }
     }
-  }
 
-  // Find servers to remove (in current but not in new)
-  const currentServerNames = Object.keys(serverMap);
-  const newServerNames = newConfigs.map((config) => config.name);
-  for (const name of currentServerNames) {
-    if (!newServerNames.includes(name)) {
-      serversToRemove.push(name);
+    // Find servers to remove (in current but not in new)
+    const currentServerNames = Object.keys(serverMap);
+    const newServerNames = newServerConfigs.map((config) => config.name);
+    for (const name of currentServerNames) {
+      if (!newServerNames.includes(name)) {
+        serversToRemove.push(name);
+      }
     }
-  }
 
-  console.log(
-    `Server changes: ${serversToAdd.length} to add, ${serversToUpdate.length} to update, ${serversToKeep.length} to keep, ${serversToRemove.length} to remove`
-  );
+    console.log(
+      `Server changes: ${serversToAdd.length} to add, ${serversToUpdate.length} to update, ${serversToKeep.length} to keep, ${serversToRemove.length} to remove`
+    );
 
-  // Remove servers that are no longer in config
-  for (const name of serversToRemove) {
-    const server = serverMap[name];
-    if (server) {
-      console.log(`Closing connection to removed server: ${name}`);
-      await server.connection.close();
-      delete serverMap[name];
+    // Remove servers that are no longer in config
+    for (const name of serversToRemove) {
+      const server = serverMap[name];
+      if (server) {
+        console.log(`Closing connection to removed server: ${name}`);
+        await server.connection.close();
+        delete serverMap[name];
+      }
     }
-  }
 
-  // Update servers with changed configs
-  for (const config of serversToUpdate) {
-    const server = serverMap[config.name];
-    if (server) {
-      console.log(`Updating server connection: ${config.name}`);
-      await server.connection.close();
-      // Create new connection
+    // Update servers with changed configs
+    for (const config of serversToUpdate) {
+      const server = serverMap[config.name];
+      if (server) {
+        console.log(`Updating server connection: ${config.name}`);
+        await server.connection.close();
+        // Create new connection
+        const newConnection = await connectToServer(config);
+        serverMap[config.name] = {
+          config,
+          connection: newConnection,
+        };
+      }
+    }
+
+    // Add new servers
+    for (const config of serversToAdd) {
+      console.log(`Adding new server connection: ${config.name}`);
       const newConnection = await connectToServer(config);
       serverMap[config.name] = {
         config,
         connection: newConnection,
       };
     }
-  }
 
-  // Add new servers
-  for (const config of serversToAdd) {
-    console.log(`Adding new server connection: ${config.name}`);
-    const newConnection = await connectToServer(config);
-    serverMap[config.name] = {
-      config,
-      connection: newConnection,
-    };
-  }
+    serverMap$.next(serverMap);
+  });
 
   // Return all current server connections
-  return Object.values(serverMap).map((s) => s.connection);
+  return {
+    serverMap$,
+    cleanup: async () => {
+      subscription.unsubscribe();
+      await Promise.all(
+        Object.values(serverMap$.getValue()).map((server) =>
+          server.connection.close()
+        )
+      );
+      serverMap$.complete();
+    },
+  };
 }

@@ -36,6 +36,7 @@
     "fast-equals": "^5.2.2",
     "file-type": "^20.4.0",
     "fuse.js": "^7.1.0",
+    "immer": "^10.1.1",
     "lucide-react": "^0.363.0",
     "mcp-proxy": "^2.7.0",
     "normalize.css": "^8.0.1",
