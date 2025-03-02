@@ -4,7 +4,12 @@ import {
   StdioServerParameters,
 } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
-import { ContentResult, FastMCP, ImageContent, TextContent } from "fastmcp";
+import {
+  ContentResult,
+  FastMCP,
+  ImageContent,
+  TextContent,
+} from "./FastMCPProxy";
 import { BehaviorSubject } from "rxjs";
 import { v4 as uuidv4 } from "uuid";
 import { z } from "zod";
@@ -13,6 +18,10 @@ import { createAnthropic } from "@ai-sdk/anthropic";
 
 import { version } from "../../package.json";
 import zodToJsonSchema from "zod-to-json-schema";
+
+const OVERRIDE_PREFIX = "__mcp_manager__";
+const REQUEST_ACTIONS_OVERRIDE_TOOL = `${OVERRIDE_PREFIX}request_actions_filter_override`;
+const OVERRIDE_TOOLS = [REQUEST_ACTIONS_OVERRIDE_TOOL] as const;
 
 type JsonSchemaParameters = {
   type: "object";
@@ -108,6 +117,7 @@ export async function connectToServer(params: ServerParameters) {
     close: () => transport.close(),
   };
 }
+type ServerConnection = Awaited<ReturnType<typeof connectToServer>>;
 
 type Awaitable<T> = T | Promise<T>;
 
@@ -125,7 +135,7 @@ interface ActionDefinition<
 }
 
 export const startMCP = async () => {
-  const server = new FastMCP({
+  const mcpServer = new FastMCP({
     name: "MCP Manager",
     version: version as `${number}.${number}.${number}`,
     authenticate: async () => ({ sessionId: uuidv4() }),
@@ -207,17 +217,60 @@ export const startMCP = async () => {
       },
     },
   ];
+
+  // Track servers that provide the overrides
+  const overrideToolServers: Partial<
+    Record<(typeof OVERRIDE_TOOLS)[number], ServerConnection>
+  > = {};
+
+  // Connect to all servers
   const servers = await Promise.all(
     serverConfigs.map(async (config) => {
       const server = await connectToServer(config);
       server.tools.subscribe((tools) => {
         console.log("tools from server", config.name, tools);
+
         for (const tool of tools) {
+          // Skip registering the override tool as a regular action
+          if (tool.name.startsWith(OVERRIDE_PREFIX)) {
+            if (
+              OVERRIDE_TOOLS.includes(
+                tool.name as (typeof OVERRIDE_TOOLS)[number]
+              )
+            ) {
+              console.log(
+                `Server ${config.name} provides ${tool.name} override tool`
+              );
+              if (overrideToolServers[tool.name]) {
+                console.error(
+                  `Server ${config.name} already has an ${tool.name} tool, overwriting`
+                );
+              }
+              overrideToolServers[tool.name] = server;
+            } else {
+              console.error(
+                `Server ${config.name} has an unknown override tool: ${tool.name}`
+              );
+            }
+            continue;
+          }
+
           registerAction({
             name: tool.name,
             description: tool.description || "",
             keywords: config.keywords,
             parameters: tool.inputSchema,
+            execute: (parameters) =>
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              server.callTool(tool.name, parameters) as any,
+          });
+
+          // Direct passthrough in case the mcp server doesn't go through dispatch-actions
+          mcpServer.addTool({
+            name: tool.name,
+            description: tool.description || "",
+            rawParameters: tool.inputSchema,
+            hidden: true,
             execute: (parameters) =>
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
               server.callTool(tool.name, parameters) as any,
@@ -251,7 +304,7 @@ export const startMCP = async () => {
     return `Request the actions that can be performed. Current available actions are related to these keywords: '${keywords.join("', '")}'`;
   };
 
-  server.addTool({
+  mcpServer.addTool({
     name: "request-actions",
     description: getKeywordsDescription(),
     parameters: z.object({
@@ -266,13 +319,93 @@ export const startMCP = async () => {
       // Get all available actions
       const allActions = Object.values(actionsRegistry);
 
+      const logAndFormatResult = (result: unknown) => {
+        const resultString = JSON.stringify(result);
+        console.log("request-actions result", resultString);
+        return resultString;
+      };
+
+      // Check if any server provides an override tool
+      const override = overrideToolServers[REQUEST_ACTIONS_OVERRIDE_TOOL];
+      if (override) {
+        try {
+          // Get the first server name that provides an override
+          console.log(
+            `Using request-actions override from server: ${override.name}`
+          );
+
+          // Call the override tool with the user's context and all available actions
+          const result = await override.callTool(
+            REQUEST_ACTIONS_OVERRIDE_TOOL,
+            {
+              why: args.why,
+              availableActions: allActions.map((action) => ({
+                name: action.name,
+                description: action.description,
+                keywords: action.keywords,
+              })),
+            }
+          );
+
+          // The override tool should return either:
+          // 1. An array of action names to include
+          // 2. An array of complete action objects
+          // 3. A string that can be parsed as JSON for either of the above
+
+          let filteredActions;
+          let parsedResult = result;
+
+          // Handle string results by parsing them
+          if (typeof result === "string") {
+            try {
+              parsedResult = JSON.parse(result);
+            } catch (e) {
+              console.error("Error parsing override tool result:", e);
+              return logAndFormatResult(allActions);
+            }
+          }
+
+          // Handle array of strings (action names)
+          if (
+            Array.isArray(parsedResult) &&
+            parsedResult.length > 0 &&
+            typeof parsedResult[0] === "string"
+          ) {
+            filteredActions = allActions.filter((action) =>
+              parsedResult.includes(action.name)
+            );
+          }
+          // Handle array of action objects
+          else if (
+            Array.isArray(parsedResult) &&
+            parsedResult.length > 0 &&
+            typeof parsedResult[0] === "object"
+          ) {
+            filteredActions = parsedResult;
+          }
+          // Fall back to all actions
+          else {
+            filteredActions = allActions;
+          }
+
+          console.log(
+            "request-actions filtered by override tool:",
+            filteredActions
+          );
+          return logAndFormatResult(filteredActions);
+        } catch (error) {
+          console.error("Error using override tool:", error);
+          // Fall back to regular filtering if the override fails
+          return logAndFormatResult(allActions);
+        }
+      }
+
+      // If no override tool is available or it failed, use the Claude filtering
       // If no API key is available, return all actions without filtering
       const anthropicApiKey = import.meta.env.VITE_ANTHROPIC_API_KEY;
       if (!anthropicApiKey) {
         console.log("No Anthropic API key found, returning all actions");
-        const result = JSON.stringify(allActions);
-        console.log("request-actions result", result);
-        return result;
+        return logAndFormatResult(allActions);
       }
 
       // Use Claude to filter and rank actions based on the user's context
@@ -324,20 +457,16 @@ export const startMCP = async () => {
             : allActions;
 
         console.log("request-actions filtered actions", filteredActions);
-        const result = JSON.stringify(filteredActions);
-        console.log("request-actions result", result);
-        return result;
+        return logAndFormatResult(filteredActions);
       } catch (error) {
         // If there's any error in the AI filtering process, fall back to returning all actions
         console.error("Error using Claude for filtering:", error);
-        const result = JSON.stringify(allActions);
-        console.log("request-actions result", result);
-        return result;
+        return logAndFormatResult(allActions);
       }
     },
   });
 
-  server.addTool({
+  mcpServer.addTool({
     name: "dispatch-actions",
     description: "Dispatch the actions available in the system",
     parameters: z.object({
@@ -358,7 +487,7 @@ export const startMCP = async () => {
     },
   });
 
-  await server.start({
+  await mcpServer.start({
     transportType: "sse",
     sse: { endpoint: "/mcp", port: 8371 },
   });
@@ -367,6 +496,6 @@ export const startMCP = async () => {
     for (const server of servers) {
       await server.close();
     }
-    await server.stop();
+    await mcpServer.stop();
   };
 };

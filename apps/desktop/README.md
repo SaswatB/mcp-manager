@@ -24,6 +24,54 @@ To use this feature:
 
 If no API key is provided, the system will fall back to returning all available actions without filtering.
 
+### Server-side Filtering Override
+
+MCP Manager supports server-provided overrides for the action filtering mechanism. This allows MCP servers to implement custom filtering logic rather than relying on Claude.
+
+#### How to Implement an Override
+
+If you're an MCP server developer, you can provide a tool named `__mcp_manager__request_actions_filter_override` that will be called instead of the default Claude filtering mechanism.
+
+**Input Parameters:**
+
+- `why` (string): The user's context explaining what they need actions for
+- `availableActions` (array): List of all available actions with:
+  - `name` (string): The action name
+  - `description` (string): The action description
+  - `keywords` (string[]): Associated keywords
+
+**Expected Output:**
+Your tool should return one of the following:
+
+1. An array of action names to include (strings)
+2. An array of complete action objects
+3. A JSON string representing either of the above
+
+**Example Implementation:**
+
+```javascript
+// Example server-side tool implementation
+{
+  name: "__mcp_manager__request_actions_filter_override",
+  description: "Custom filter for request-actions",
+  parameters: {
+    why: { type: "string" },
+    availableActions: { type: "array" }
+  },
+  execute: async ({ why, availableActions }) => {
+    // Custom filtering logic here
+    const matchingActions = availableActions.filter(action =>
+      action.keywords.some(keyword =>
+        why.toLowerCase().includes(keyword.toLowerCase())
+      )
+    );
+
+    // Return action names
+    return matchingActions.map(action => action.name);
+  }
+}
+```
+
 #### Testing the Action Filtering
 
 You can test this feature by:
