@@ -8,6 +8,8 @@ import { ContentResult, FastMCP, ImageContent, TextContent } from "fastmcp";
 import { BehaviorSubject } from "rxjs";
 import { v4 as uuidv4 } from "uuid";
 import { z } from "zod";
+import { generateObject } from "ai";
+import { createAnthropic } from "@ai-sdk/anthropic";
 
 import { version } from "../../package.json";
 import zodToJsonSchema from "zod-to-json-schema";
@@ -255,15 +257,83 @@ export const startMCP = async () => {
     parameters: z.object({
       why: z.string({
         description:
-          "Please give context on what you need actions for, this will help provide the relevant actions. Actions returned must be called with dispatch-actions tool.",
+          "Please give context on what you need actions for, this will help provide the relevant actions. Actions returned MUST be called with dispatch-actions tool.",
       }),
     }),
     execute: async (args, context) => {
       console.log("request-actions tool called", args, context);
-      // Return all available actions metadata (without execute functions)
-      const actions = JSON.stringify(Object.values(actionsRegistry));
-      console.log("request-actions actions", actions);
-      return actions;
+
+      // Get all available actions
+      const allActions = Object.values(actionsRegistry);
+
+      // If no API key is available, return all actions without filtering
+      const anthropicApiKey = import.meta.env.VITE_ANTHROPIC_API_KEY;
+      if (!anthropicApiKey) {
+        console.log("No Anthropic API key found, returning all actions");
+        const result = JSON.stringify(allActions);
+        console.log("request-actions result", result);
+        return result;
+      }
+
+      // Use Claude to filter and rank actions based on the user's context
+      try {
+        const userContext = args.why;
+
+        // Prepare action data for the prompt
+        const actionsData = allActions.map((action) => ({
+          name: action.name,
+          description: action.description,
+          keywords: action.keywords.join(", "),
+        }));
+
+        // Define the schema for the expected response
+        const responseSchema = z.object({
+          relevantActions: z
+            .array(z.string())
+            .describe(
+              "Names of actions that are relevant to the user's request"
+            ),
+        });
+
+        // Generate the object using Vercel AI SDK's generateObject
+        const {
+          object: { relevantActions },
+        } = await generateObject({
+          model: createAnthropic({
+            apiKey: anthropicApiKey,
+          })("claude-3-sonnet-20240229"),
+          schema: responseSchema,
+          prompt: `
+          The user needs help with: "${userContext}"
+          
+          Available actions:
+          ${JSON.stringify(actionsData, null, 2)}
+          
+          Based on the user's request, please identify the action names that would be most relevant and helpful.
+          Only include actions that are truly relevant to what the user is asking for.
+          `,
+          maxTokens: 1000,
+        });
+
+        // Filter actions based on the names returned by Claude
+        const filteredActions =
+          relevantActions.length > 0
+            ? allActions.filter((action) =>
+                relevantActions.includes(action.name)
+              )
+            : allActions;
+
+        console.log("request-actions filtered actions", filteredActions);
+        const result = JSON.stringify(filteredActions);
+        console.log("request-actions result", result);
+        return result;
+      } catch (error) {
+        // If there's any error in the AI filtering process, fall back to returning all actions
+        console.error("Error using Claude for filtering:", error);
+        const result = JSON.stringify(allActions);
+        console.log("request-actions result", result);
+        return result;
+      }
     },
   });
 
